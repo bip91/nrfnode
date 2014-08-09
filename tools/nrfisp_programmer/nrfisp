@@ -1,0 +1,150 @@
+#!/usr/bin/python
+#
+# NRF24L programmer in Python
+#
+#
+
+import os
+import sys
+import time
+
+import usb.core
+import usb.util
+
+from intelhex import IntelHex
+ 
+packet_len = 64
+ 
+# Packing a request. Please see  documentation for the list of all commands
+# Packets are 64 bytes long, most of the commands are 4 bytes long. So up to 18
+# can be batched into a packet.
+def pack_request(*arguments):
+	packet = [0x0] * packet_len
+	i = 0
+	for arg in arguments:
+		packet[i] = arg
+		i += 1
+	return ''.join([chr(c) for c in packet])
+
+def pack(packet):
+	return (''.join([chr(c) for c in packet])).ljust(64,'\x00')
+
+# Logs error to the error output
+def log_error(functionName, ret):
+	sys.stderr.write(functionName + (" failed with return code %d\n" % ret))
+ 
+# Logs result onto standard output. Result is 64 bytes as decimal numbers
+# Response is 64 bytes long
+def show_result(bytes):
+	sys.stdout.write(''.join(['%02x ' % abyte for abyte in bytes]))
+
+def CheckHex(myaddr):
+	if myaddr[0:2] == "0x" :
+		return int(myaddr[2::],16)
+	return int(myaddr)
+
+def callhid(bytes, wait=0):
+	raw = pack(bytes)
+	dev.write(1, raw, 0, 100)
+	if wait :
+		time.sleep(wait)
+	return dev.read(0x82, packet_len, 0, 100)
+
+# main procedure
+
+dev = usb.core.find(idVendor=0x03eb, idProduct=0x4b8f)
+
+# was it found?
+if dev is None:
+	raise ValueError('Device not found')
+
+try:
+	dev.detach_kernel_driver(0)
+except: # this usually mean that kernel driver has already been dettached
+	pass
+
+# set the active configuration, only one. But need to be set
+try:
+	dev.set_configuration(1)
+except:
+	pass
+
+# Identifying command
+try:
+	cmd = sys.argv[1]
+	if cmd == "start" :
+		callhid([0x5A, 0xA5, 0xAA])
+	elif cmd == "stop" :
+		callhid([0x5A, 0xA5, 0xAC])
+	elif cmd == "erase" :
+		callhid([0x5A, 0xA5, 0xAB])
+		# 0x01, 0x5a... is required, but must be analyzed
+		callhid([0x5A, 0xA5, 0x62, 0x00, 0x00, 0x00, 0x01, 0x5a, 0xd0, 0x93, 0x9a],0.5)
+		callhid([0x5A, 0xA5, 0xAC])
+	elif cmd == "readinfo" :
+		callhid([0x5A, 0xA5, 0xAB])
+		show_result(callhid([0x5A, 0xA5, 0x89]))
+		callhid([0x5A, 0xA5, 0xAC])
+	elif cmd == "dump" or cmd == "read" :
+		addr_start = CheckHex(sys.argv[2])
+		# parameter 2 : end of memory
+		try :
+			addr_stop = CheckHex(sys.argv[3])
+		except :
+			addr_stop = 0x3FFF
+			if addr_start > addr_stop : # NV RAM Ext.
+				addr_stop = 0xFBFF
+			if addr_start > addr_stop : # NV RAM Std
+				addr_stop = 0xFFFF
+								
+		# read memory into ihex
+		ihex = IntelHex()
+		callhid([0x5A, 0xA5, 0xAB])
+		for addr in range(addr_start & 0xFFE0, addr_stop, packet_len) : # TODO : Update later O
+			for i,v in enumerate(callhid([0x5A, 0xA5, 0x03, addr / 0x100, addr % 0x100])) :
+				if addr + i > addr_start and addr + i < addr_stop :
+					ihex[addr+i] = v
+		callhid([0x5A, 0xA5, 0xAC])
+		if cmd == "read" :
+			for addr in range(addr_start & 0xFFF0, ((addr_stop + 14) & 0xFFF0), 0x10) :
+				sys.stdout.write("\n%04x : " % addr)
+				for i in range(addr, addr + 15) :
+					sys.stdout.write("%02x " % ihex[addr+i])
+			print
+		else :
+			#shrink unused byte
+			i = ihex.maxaddr()
+			while i > ihex.minaddr() and ihex[i]==0xFF :
+				del(ihex[i])
+				i -= 1
+			ihex.write_hex_file(sys.stdout)
+	elif cmd == "prog"  :
+		ihex = IntelHex(sys.argv[2])
+		callhid([0x5A, 0xA5, 0xAB])
+		addr_start = ihex.minaddr() & 0xffe0
+		print "Write Data", ihex.minaddr(), addr_start 
+		hdr = [0x5A, 0xA5, 0x02, 0x00, 0x00, 0x40, 0x00,0x00]
+		hdr += [0x00] * (packet_len / 2 - len(hdr))
+		for addr in range(addr_start, ihex.maxaddr(), packet_len/2):
+			hdr[3] = addr / 0x100
+			hdr[4] = addr % 0x100
+			msg = []
+			for i in range(0, packet_len / 2) :
+				msg += [ihex[addr + i]]
+			callhid(hdr + msg)
+		callhid([0x5A, 0xA5, 0xAC])
+		print "Done"
+	elif cmd == "test"  :
+		addr = int(sys.argv[2],16)
+		mem  = [0x5A, 0xA5, 0x03, addr / 0x100, addr % 0x100, 0x00, 0x0, 0x00,
+			    0xa6, 0x1a, 0x01, 0x5b, 0x00, 0x00, 0x00, 0x00]
+		print "Test"
+		callhid([0x5A, 0xA5, 0xAB])
+		show_result(callhid(mem))
+		callhid([0x5A, 0xA5, 0xAC])
+		print "Done"
+	
+except(ValueError):
+	raise ValueError('Bad command')
+except(IndexError):
+	raise ValueError('lack some parameters')
